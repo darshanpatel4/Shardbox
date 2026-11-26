@@ -208,6 +208,65 @@ class TransferTests(unittest.TestCase):
         job = self.run_job(lambda: self.manager.add_download(rec, str(out)))
         self.assertEqual(job.result_path.name, "big (1).bin")
 
+    def test_folder_upload_keeps_structure_and_parallel_limit(self):
+        tree = self.root / "Project"
+        (tree / "src" / "deep").mkdir(parents=True)
+        (tree / "empty").mkdir()
+        names = {"a.txt": tree, "b.txt": tree / "src", "c.txt": tree / "src" / "deep"}
+        for name, folder in names.items():
+            (folder / name).write_bytes(name.encode() * 100)
+        for i in range(40):
+            (tree / "src" / f"many{i}.txt").write_bytes(b"x")
+
+        peak = 0
+        original = self.tg.upload_range
+
+        async def counting_upload(*args):
+            nonlocal peak
+            peak = max(peak, self.manager._running)
+            await asyncio.sleep(0)
+            return await original(*args)
+
+        self.tg.upload_range = counting_upload
+
+        async def go():
+            count = await self.manager.add_folder_upload_async(str(tree), None)
+            while self.manager.has_active():
+                await asyncio.sleep(0.01)
+            return count
+
+        self.assertEqual(asyncio.run(go()), 43)
+        self.assertTrue(all(j.state == DONE for j in self.manager.jobs), [j.error for j in self.manager.jobs])
+        self.assertLessEqual(peak, self.settings.parallel_files)
+        self.assertEqual(self.manager._running, 0)
+
+        root_folders, _ = self.index.children(None)
+        self.assertEqual([f.name for f in root_folders], ["Project"])
+        project = root_folders[0]
+        subfolders, files = self.index.children(project.id)
+        self.assertEqual(sorted(f.name for f in subfolders), ["empty", "src"])
+        self.assertEqual([f.name for f in files], ["a.txt"])
+        src = next(f for f in subfolders if f.name == "src")
+        deep = self.index.children(src.id)[0][0]
+        self.assertEqual([f.name for f in self.index.children(deep.id)[1]], ["c.txt"])
+        self.assertEqual(len(self.index.children(src.id)[1]), 41)  # b.txt + 40 small files
+
+    def test_cancelled_waiting_jobs_are_skipped(self):
+        self.settings.parallel_files = 1
+
+        async def go():
+            first = self.manager.add_upload(str(self.source), None)
+            waiting = self.manager.add_upload(str(self.source), None)
+            last = self.manager.add_upload(str(self.source), None)
+            self.manager.cancel(waiting)  # cancelled before it ever started
+            while self.manager.has_active():
+                await asyncio.sleep(0.01)
+            return first, waiting, last
+
+        first, waiting, last = asyncio.run(go())
+        self.assertEqual((first.state, waiting.state, last.state), (DONE, "Cancelled", DONE))
+        self.assertIsNone(waiting.task)
+
     def test_resume_after_failure(self):
         self.tg.fail_upload_numbers = {2}
         job = self.run_job(lambda: self.manager.add_upload(str(self.source), None))

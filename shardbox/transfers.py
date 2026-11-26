@@ -15,6 +15,7 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
@@ -90,6 +91,15 @@ def unique_local_path(path: Path) -> Path:
     raise AssertionError("unreachable")
 
 
+def scan_folder(root: Path) -> list[tuple[Path, list[str], list[str]]]:
+    """(folder, its subfolders, its files) for every folder under root, sorted. Safe on any thread."""
+    tree = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        tree.append((Path(dirpath), list(dirnames), sorted(filenames)))
+    return tree
+
+
 class TransferManager(QObject):
     job_added = Signal(object)
     job_finished = Signal(object)
@@ -101,23 +111,29 @@ class TransferManager(QObject):
         self.settings = settings
         self.cache_dir = cache_dir
         self.jobs: list[Job] = []
+        self._waiting: deque[Job] = deque()  # jobs not started yet, oldest first
+        self._running = 0
+        self._hold_pump = False
 
     # ------------------------------------------------------------ queue
 
     def _add(self, job: Job) -> Job:
         self.jobs.append(job)
+        self._waiting.append(job)
         self.job_added.emit(job)
-        self.pump()
+        if not self._hold_pump:
+            self.pump()
         return job
 
     def pump(self) -> None:
-        running = sum(1 for j in self.jobs if j.running)
-        for job in self.jobs:
-            if running >= max(1, self.settings.parallel_files):
-                break
-            if job.state == QUEUED and job.task is None:
-                job.task = asyncio.ensure_future(self._run(job))
-                running += 1
+        """Start waiting jobs until "files at once" are running. Cheap even with thousands queued."""
+        limit = max(1, self.settings.parallel_files)
+        while self._running < limit and self._waiting:
+            job = self._waiting.popleft()
+            if job.state != QUEUED or job.task is not None:
+                continue  # cancelled while waiting
+            self._running += 1
+            job.task = asyncio.ensure_future(self._run(job))
 
     def add_upload(self, local_path: str, folder_id: int | None) -> Job:
         job = Job(UPLOAD, Path(local_path).name)
@@ -127,20 +143,33 @@ class TransferManager(QObject):
 
     def add_folder_upload(self, local_dir: str, parent_id: int | None) -> int:
         """Recreate a local folder tree in the index and queue every file in it."""
+        return self._queue_scanned(Path(local_dir), scan_folder(Path(local_dir)), parent_id)
+
+    async def add_folder_upload_async(self, local_dir: str, parent_id: int | None) -> int:
+        """Same, but reads the folder tree on a background thread so the window never freezes."""
         root = Path(local_dir)
+        tree = await asyncio.get_running_loop().run_in_executor(IO_POOL, scan_folder, root)
+        return self._queue_scanned(root, tree, parent_id)
+
+    def _queue_scanned(self, root: Path, tree: list[tuple[Path, list[str], list[str]]], parent_id: int | None) -> int:
         count = 0
-        with self.index.batch():
-            top = self.index.create_folder(parent_id, sanitize_name(root.name), make_unique=True)
-            folder_ids = {root: top.id}
-            for dirpath, dirnames, filenames in os.walk(root):
-                here = Path(dirpath)
-                fid = folder_ids[here]
-                dirnames.sort()
-                for d in dirnames:
-                    folder_ids[here / d] = self.index.create_folder(fid, sanitize_name(d), make_unique=True).id
-                for f in sorted(filenames):
-                    self.add_upload(str(here / f), fid)
-                    count += 1
+        self._hold_pump = True  # start uploads once at the end, not after every file
+        try:
+            with self.index.batch():
+                top = self.index.create_folder(parent_id, sanitize_name(root.name), make_unique=True)
+                folder_ids = {root: top.id}
+                for here, dirnames, filenames in tree:
+                    fid = folder_ids.get(here)
+                    if fid is None:
+                        continue
+                    for d in dirnames:
+                        folder_ids[here / d] = self.index.create_folder(fid, sanitize_name(d), make_unique=True).id
+                    for f in filenames:
+                        self.add_upload(str(here / f), fid)
+                        count += 1
+        finally:
+            self._hold_pump = False
+        self.pump()
         return count
 
     def add_download(self, rec: FileRec, dest_dir: str | None, *, use_cache: bool = False) -> Job:
@@ -225,6 +254,7 @@ class TransferManager(QObject):
                 job.error = str(exc) or type(exc).__name__
         finally:
             job.finished_at = time.time()
+            self._running -= 1
             self.job_finished.emit(job)
             self.pump()
 

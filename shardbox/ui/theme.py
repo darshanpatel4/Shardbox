@@ -231,6 +231,7 @@ QProgressBar[state="failed"]::chunk {{ background: {DANGER}; }}
 #TransferRow {{ border-bottom: 1px solid {ROW_LINE}; }}
 #TransferName {{ font-weight: 600; }}
 #TransferPct, #TransferMeta {{ color: {MUTED}; font-size: 12px; }}
+#TransferMore {{ color: {MUTED}; font-size: 12px; }}
 #TransferMeta[state="failed"] {{ color: {DANGER}; }}
 #RowAction {{ padding: 3px; border-radius: 11px; }}
 

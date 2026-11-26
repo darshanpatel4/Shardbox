@@ -41,6 +41,9 @@ from .common import human_duration, human_size
 CARD_WIDTH = 380
 MARGIN = 16
 MAX_BODY_HEIGHT = 300
+MAX_WAITING_ROWS = 5  # rows for jobs that haven't started yet
+MAX_FAILED_ROWS = 20
+MAX_DONE_ROWS = 10
 
 
 class ElidedLabel(QLabel):
@@ -214,13 +217,20 @@ def show_in_folder(path: str) -> None:
 
 
 class TransfersCard(QFrame):
-    """Floats over the bottom-right corner of ``anchor`` and lists uploads and downloads."""
+    """Floats over the bottom-right corner of ``anchor`` and lists uploads and downloads.
+
+    A folder can queue thousands of files, so the card never makes a row for every job:
+    it shows everything that's running plus a few waiting, failed and finished ones, and a
+    "N more waiting" line. Updates are batched, so a burst of new or finished jobs costs one
+    redraw instead of one per job.
+    """
 
     def __init__(self, manager: TransferManager, anchor: QWidget):
         super().__init__(anchor)
         self.manager = manager
         self.anchor = anchor
-        self.rows: dict[int, TransferRow] = {}
+        self.rows: dict[int, TransferRow] = {}  # only the jobs currently shown
+        self._order: list[int] = []
         self._speed: dict[int, tuple[float, int, float]] = {}  # job id -> (time, bytes, speed)
         self._collapsed = False
 
@@ -262,6 +272,11 @@ class TransfersCard(QFrame):
         self.list_layout = QVBoxLayout(self.list)
         self.list_layout.setContentsMargins(0, 0, 0, 0)
         self.list_layout.setSpacing(0)
+        self.more = QLabel()
+        self.more.setObjectName("TransferMore")
+        self.more.setContentsMargins(18, 10, 12, 10)
+        self.more.hide()
+        self.list_layout.addWidget(self.more)
         self.list_layout.addStretch(1)
         self.body = QScrollArea()
         self.body.setObjectName("TransferBody")
@@ -278,8 +293,13 @@ class TransfersCard(QFrame):
         layout.addWidget(header)
         layout.addWidget(self.body)
 
-        manager.job_added.connect(self._add_job)
-        manager.job_finished.connect(lambda _job: self.refresh())
+        # New or finished jobs only schedule an update; many at once still cost one redraw.
+        self._soon = QTimer(self)
+        self._soon.setSingleShot(True)
+        self._soon.setInterval(100)
+        self._soon.timeout.connect(self.refresh)
+        manager.job_added.connect(self._on_job_added)
+        manager.job_finished.connect(lambda _job: self._schedule())
         anchor.installEventFilter(self)
 
         self._timer = QTimer(self)
@@ -329,33 +349,67 @@ class TransfersCard(QFrame):
     def _place(self) -> None:
         width = max(220, min(CARD_WIDTH, self.anchor.width() - 2 * MARGIN))
         height = 50 if self._collapsed else 56
-        if not self._collapsed and self.rows:
+        more_shown = not self.more.isHidden()
+        if not self._collapsed and (self.rows or more_shown):
             rows_height = sum(row.sizeHint().height() for row in self.rows.values())
+            if more_shown:
+                rows_height += self.more.sizeHint().height()
             room = self.anchor.height() - 2 * MARGIN - height
             height += max(60, min(rows_height, MAX_BODY_HEIGHT, room))
         self.setGeometry(self.anchor.width() - width - MARGIN, self.anchor.height() - height - MARGIN, width, height)
 
     # ------------------------------------------------------------ rows
 
-    def _add_job(self, job: Job) -> None:
-        row = TransferRow(job, self)
-        self.rows[job.id] = row
-        self.list_layout.insertWidget(self.list_layout.count() - 1, row)
-        if self._collapsed:
-            self.toggle_collapsed()
-        self.show_card()
-        self._place()
-        QTimer.singleShot(0, lambda: self.body.ensureWidgetVisible(row))
+    def _on_job_added(self, _job: Job) -> None:
+        if not self.isVisible():
+            if self._collapsed:
+                self.toggle_collapsed()
+            self.show()
+            self.raise_()
+        self._schedule()
+
+    def _schedule(self) -> None:
+        if not self._soon.isActive():
+            self._soon.start()
 
     def clear_finished(self) -> None:
         self.manager.clear_finished()
-        for job_id, row in list(self.rows.items()):
-            if row.job.finished:
-                row.deleteLater()
-                del self.rows[job_id]
-                self._speed.pop(job_id, None)
         self.refresh()
-        self._place()
+
+    @staticmethod
+    def _pick(jobs: list[Job]) -> list[Job]:
+        """The jobs worth a row: all running, plus a few waiting, failed and finished."""
+        running: list[Job] = []
+        waiting: list[Job] = []
+        failed: list[Job] = []
+        done: list[Job] = []
+        for job in jobs:
+            if job.state == QUEUED:
+                if len(waiting) < MAX_WAITING_ROWS:
+                    waiting.append(job)
+            elif job.state in (FAILED, CANCELLED):
+                failed.append(job)
+            elif job.state == DONE:
+                done.append(job)
+            else:
+                running.append(job)
+        return running + waiting + failed[-MAX_FAILED_ROWS:] + done[-MAX_DONE_ROWS:][::-1]
+
+    def _sync_rows(self, shown: list[Job]) -> None:
+        keep = {job.id for job in shown}
+        for job_id in [i for i in self.rows if i not in keep]:
+            row = self.rows.pop(job_id)
+            self.list_layout.removeWidget(row)
+            row.deleteLater()
+            self._speed.pop(job_id, None)
+        for position, job in enumerate(shown):
+            row = self.rows.get(job.id)
+            if row is None:
+                row = self.rows[job.id] = TransferRow(job, self)
+            else:
+                self.list_layout.removeWidget(row)
+            self.list_layout.insertWidget(position, row)
+        self._order = [job.id for job in shown]
 
     def _rate(self, job: Job) -> float:
         now = time.monotonic()
@@ -375,27 +429,50 @@ class TransfersCard(QFrame):
     def refresh(self) -> None:
         if not self.isVisible():
             return
-        uploading = downloading = finished = failed = 0
+        jobs = self.manager.jobs
+        shown = self._pick(jobs)
+        changed = [job.id for job in shown] != self._order
+        if changed:
+            self._sync_rows(shown)
         for row in self.rows.values():
-            job = row.job
-            row.update_from_job(0.0 if job.finished else self._rate(job))
-            if job.finished:
-                finished += 1
+            row.update_from_job(0.0 if row.job.finished else self._rate(row.job))
+
+        uploading = downloading = waiting = done = failed = 0
+        for job in jobs:
+            if job.state == DONE:
+                done += 1
+            elif job.state in (FAILED, CANCELLED):
                 failed += job.state == FAILED
             elif job.kind == UPLOAD:
                 uploading += 1
             else:
                 downloading += 1
+            waiting += job.state == QUEUED
 
         parts = []
         if uploading:
-            parts.append(f"Uploading {uploading} item{'s' if uploading != 1 else ''}")
+            parts.append(f"Uploading {uploading:,} item{'s' if uploading != 1 else ''}")
         if downloading:
             word = "downloading" if parts else "Downloading"
-            parts.append(f"{word} {downloading}" + ("" if parts else f" item{'s' if downloading != 1 else ''}"))
+            parts.append(f"{word} {downloading:,}" + ("" if parts else f" item{'s' if downloading != 1 else ''}"))
         if not parts:
-            parts.append("All transfers finished" if self.rows else "No transfers")
+            parts.append("All transfers finished" if jobs else "No transfers")
+        elif done:
+            parts.append(f"{done:,} done")
         if failed:
-            parts.append(f"{failed} failed")
+            parts.append(f"{failed:,} failed")
         self.title.setText(" · ".join(parts))
-        self.clear_button.setVisible(finished > 0)
+        self.clear_button.setVisible(len(jobs) > uploading + downloading)
+
+        hidden_waiting = waiting - sum(1 for job in shown if job.state == QUEUED)
+        hidden_done = done - sum(1 for job in shown if job.state == DONE)
+        more = []
+        if hidden_waiting > 0:
+            more.append(f"{hidden_waiting:,} more waiting")
+        if hidden_done > 0:
+            more.append(f"{hidden_done:,} more finished")
+        had_more = not self.more.isHidden()
+        self.more.setText(" · ".join(more))
+        self.more.setVisible(bool(more))
+        if changed or had_more != bool(more):
+            self._place()

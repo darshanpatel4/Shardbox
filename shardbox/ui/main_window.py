@@ -201,15 +201,21 @@ class MainWindow(QMainWindow):
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
-        self._refresh_timer.setInterval(150)
+        self._refresh_timer.setInterval(250)
         self._refresh_timer.timeout.connect(self.refresh)
 
-        index.add_listener(self._refresh_timer.start)
-        self.manager.job_added.connect(lambda _job: self._refresh_timer.start())
+        index.add_listener(self._schedule_refresh)
+        self.manager.job_added.connect(lambda _job: self._schedule_refresh())
         self.manager.job_finished.connect(self._on_job_finished)
         self.backup.status_changed.connect(self.backup_label.setText)
         theme.notifier().changed.connect(self._retheme)
         self.refresh()
+
+    def _schedule_refresh(self) -> None:
+        # Throttle, don't debounce: restarting the timer on every event meant that during a long
+        # upload (an event every few ms) the window never refreshed at all.
+        if not self._refresh_timer.isActive():
+            self._refresh_timer.start()
 
     # ================================================================ building
 
@@ -829,17 +835,29 @@ class MainWindow(QMainWindow):
             self._upload_paths([path])
 
     def _upload_paths(self, paths: list[str]) -> None:
-        files = folders = 0
+        files = 0
+        folders = [p for p in paths if os.path.isdir(p)]
         for path in paths:
-            if os.path.isdir(path):
-                files += self.manager.add_folder_upload(path, self.current)
-                folders += 1
-            elif os.path.isfile(path):
+            if os.path.isfile(path):
                 self.manager.add_upload(path, self.current)
                 files += 1
-        if files or folders:
+        if files:
             self.transfers.show_card()
-            self.statusBar().showMessage(f"Queued {files} file(s) for upload", 4000)
+            self.statusBar().showMessage(f"Queued {files:,} file{'' if files == 1 else 's'} for upload", 4000)
+        if folders:
+            spawn(self._upload_folders(folders, self.current), parent=self, error_title="Upload folder failed")
+
+    async def _upload_folders(self, folders: list[str], parent_id: int | None) -> None:
+        # Reading a big folder tree happens on a background thread, so the window stays responsive.
+        self.statusBar().showMessage("Reading folder…")
+        files = 0
+        for path in folders:
+            files += await self.manager.add_folder_upload_async(path, parent_id)
+        self.transfers.show_card()
+        self.statusBar().showMessage(
+            f"Queued {files:,} file{'' if files == 1 else 's'} from "
+            f"{len(folders)} folder{'' if len(folders) == 1 else 's'} for upload", 6000,
+        )
 
     def download_selected(self) -> None:
         files = self._selected_files()
@@ -978,7 +996,7 @@ class MainWindow(QMainWindow):
             )
 
     def _on_job_finished(self, job: Job) -> None:
-        self._refresh_timer.start()
+        self._schedule_refresh()
         if job.id in self._open_when_done:
             self._open_when_done.discard(job.id)
             if job.state == DONE and job.result_path:

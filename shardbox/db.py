@@ -152,16 +152,18 @@ class Index:
         self._listeners.append(callback)
 
     def _changed(self) -> None:
-        self.conn.commit()
         if self._batch_depth:
+            # Inside batch(): save once at the end. Committing every row costs a disk sync
+            # each, which froze the window for seconds when adding a folder with many subfolders.
             self._pending_notify = True
             return
+        self.conn.commit()
         for callback in list(self._listeners):
             callback()
 
     @contextmanager
     def batch(self) -> Iterator[None]:
-        """Group many changes into a single change notification."""
+        """Group many changes into one save to disk and one change notification."""
         self._batch_depth += 1
         try:
             yield
