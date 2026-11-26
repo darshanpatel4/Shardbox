@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shardbox"
+dynamic = ["version"]
+description = "A Google Drive-like desktop app that stores your files in your own private Telegram channel."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "telethon>=1.36,<2",
+    "cryptg>=0.4",
+    "PySide6>=6.6",
+    "qasync>=0.27",
+]
+keywords = ["telegram", "cloud storage", "drive", "backup", "desktop"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Environment :: X11 Applications :: Qt",
+    "Topic :: System :: Archiving :: Backup",
+]
+
+[project.gui-scripts]
+shardbox = "shardbox.app:main"
+
+[tool.setuptools]
+packages = ["shardbox", "shardbox.ui"]
+
+[tool.setuptools.dynamic]
+version = { attr = "shardbox.__version__" }

@@ -1,0 +1,34 @@
+# --- Secrets: never commit these -------------------------------------------
+# A Telegram session file gives FULL access to the Telegram account.
+*.session
+*.session-journal
+settings.json
+index.db
+*.db
+*.bak
+.env
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Build output ---------------------------------------------------------------
+build/
+dist/
+*.spec
+!packaging/shardbox.spec
+
+# --- Editors / OS ------------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Claude Code local settings ------------------------------------------------
+.claude/settings.local.json

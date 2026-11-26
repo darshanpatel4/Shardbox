@@ -1,0 +1,77 @@
+# Builds the Windows installer and zip and attaches them to a GitHub Release.
+#
+# To publish a version:
+#   1. set __version__ in shardbox/__init__.py (e.g. "0.2.0") and commit
+#   2. git tag v0.2.0 && git push origin v0.2.0
+#   3. wait for this workflow, then open the draft release on GitHub, check it and press Publish
+#
+# "Run workflow" on the Actions tab builds the files without making a release (download them
+# from the run's Artifacts).
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-build.txt
+
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m unittest discover -s tests -v
+
+      - name: Check the tag matches the app version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version=$(python -c "import shardbox; print(shardbox.__version__)")
+          if [ "v$version" != "${GITHUB_REF_NAME}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match __version__ $version in shardbox/__init__.py"
+            exit 1
+          fi
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --no-progress -y
+          }
+
+      - name: Build
+        run: python tools/build_windows.py
+
+      - name: Keep the files with this run
+        uses: actions/upload-artifact@v4
+        with:
+          name: shardbox-windows
+          path: |
+            dist/Shardbox-*-Setup.exe
+            dist/Shardbox-*-win64.zip
+            dist/SHA256SUMS.txt
+
+      - name: Create draft release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            dist/Shardbox-*-Setup.exe
+            dist/Shardbox-*-win64.zip
+            dist/SHA256SUMS.txt
